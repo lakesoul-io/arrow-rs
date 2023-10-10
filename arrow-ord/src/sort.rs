@@ -111,7 +111,7 @@ where
     F: FnMut(&T, &T) -> Ordering,
 {
     if array.len() == limit {
-        array.sort_unstable_by(cmp);
+        array.sort_by(cmp);
     } else {
         partial_sort(array, limit, cmp);
     }
@@ -1126,7 +1126,7 @@ where
     F: FnMut(&T, &T) -> Ordering,
 {
     let (before, _mid, _after) = v.select_nth_unstable_by(limit, &mut is_less);
-    before.sort_unstable_by(is_less);
+    before.sort_by(is_less);
 }
 
 type LexicographicalCompareItem<'a> = (
