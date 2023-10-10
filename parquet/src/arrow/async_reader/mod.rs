@@ -77,7 +77,6 @@
 
 use std::collections::VecDeque;
 use std::fmt::Formatter;
-use std::future::Future;
 
 use std::io::SeekFrom;
 use std::ops::Range;
@@ -89,7 +88,6 @@ use bytes::{Buf, Bytes};
 use futures::future::{BoxFuture, FutureExt};
 use futures::ready;
 use futures::stream::Stream;
-use futures_util::stream::{FuturesOrdered, StreamExt};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
@@ -279,8 +277,6 @@ impl<T: AsyncFileReader + Send + 'static> ArrowReaderBuilder<AsyncReader<T>> {
             offset: self.offset,
         };
 
-        let prefetch = self.prefetch;
-
         Ok(ParquetRecordBatchStream {
             metadata: self.metadata,
             batch_size,
@@ -288,15 +284,13 @@ impl<T: AsyncFileReader + Send + 'static> ArrowReaderBuilder<AsyncReader<T>> {
             projection: self.projection,
             selection: self.selection,
             schema: self.schema,
-            reader: Arc::new(reader),
+            reader: Some(reader),
             state: StreamState::Init,
-            row_groups_read_queue: FuturesOrdered::new(),
-            prefetch,
         })
     }
 }
 
-type ReadResult = Result<Option<ParquetRecordBatchReader>>;
+type ReadResult<T> = Result<(ReaderFactory<T>, Option<ParquetRecordBatchReader>)>;
 
 /// [`ReaderFactory`] is used by [`ParquetRecordBatchStream`] to create
 /// [`ParquetRecordBatchReader`]
@@ -314,9 +308,6 @@ struct ReaderFactory<T> {
     offset: Option<usize>,
 }
 
-unsafe impl<T> Sync for ReaderFactory<T> {}
-unsafe impl<T> Send for ReaderFactory<T> {}
-
 impl<T> ReaderFactory<T>
 where
     T: AsyncFileReader + Send,
@@ -324,18 +315,17 @@ where
     /// Reads the next row group with the provided `selection`, `projection` and `batch_size`
     ///
     /// Note: this captures self so that the resulting future has a static lifetime
-    async unsafe fn read_row_group(
-        mut self: Arc<Self>,
+    async fn read_row_group(
+        mut self,
         row_group_idx: usize,
         mut selection: Option<RowSelection>,
         projection: ProjectionMask,
         batch_size: usize,
-    ) -> ReadResult {
+    ) -> ReadResult<T> {
         // TODO: calling build_array multiple times is wasteful
-        let this = Arc::get_mut_unchecked(&mut self);
 
-        let meta = this.metadata.row_group(row_group_idx);
-        let page_locations = this
+        let meta = self.metadata.row_group(row_group_idx);
+        let page_locations = self
             .metadata
             .offset_index()
             .map(|x| x[row_group_idx].as_slice());
@@ -348,19 +338,19 @@ where
             page_locations,
         };
 
-        if let Some(filter) = this.filter.as_mut() {
+        if let Some(filter) = self.filter.as_mut() {
             for predicate in filter.predicates.iter_mut() {
                 if !selects_any(selection.as_ref()) {
-                    return Ok(None);
+                    return Ok((self, None));
                 }
 
                 let predicate_projection = predicate.projection();
                 row_group
-                    .fetch(&mut this.input, predicate_projection, selection.as_ref())
+                    .fetch(&mut self.input, predicate_projection, selection.as_ref())
                     .await?;
 
                 let array_reader = build_array_reader(
-                    this.fields.as_ref(),
+                    self.fields.as_ref(),
                     predicate_projection,
                     &row_group,
                 )?;
@@ -381,10 +371,10 @@ where
             .unwrap_or(row_group.row_count);
 
         if rows_before == 0 {
-            return Ok(None);
+            return Ok((self, None));
         }
 
-        selection = apply_range(selection, row_group.row_count, this.offset, this.limit);
+        selection = apply_range(selection, row_group.row_count, self.offset, self.limit);
 
         // Compute the number of rows in the selection after applying limit and offset
         let rows_after = selection
@@ -393,52 +383,51 @@ where
             .unwrap_or(row_group.row_count);
 
         // Update offset if necessary
-        if let Some(offset) = &mut this.offset {
+        if let Some(offset) = &mut self.offset {
             // Reduction is either because of offset or limit, as limit is applied
             // after offset has been "exhausted" can just use saturating sub here
             *offset = offset.saturating_sub(rows_before - rows_after)
         }
 
         if rows_after == 0 {
-            return Ok(None);
+            return Ok((self, None));
         }
 
-        if let Some(limit) = &mut this.limit {
+        if let Some(limit) = &mut self.limit {
             *limit -= rows_after;
         }
 
         row_group
-            .fetch(&mut this.input, &projection, selection.as_ref())
+            .fetch(&mut self.input, &projection, selection.as_ref())
             .await?;
 
         let reader = ParquetRecordBatchReader::new(
             batch_size,
-            build_array_reader(this.fields.as_ref(), &projection, &row_group)?,
+            build_array_reader(self.fields.as_ref(), &projection, &row_group)?,
             selection,
         );
 
-        Ok(Some(reader))
+        Ok((self, Some(reader)))
     }
 }
 
-enum StreamState {
+enum StreamState<T> {
     /// At the start of a new row group, or the end of the parquet stream
     Init,
     /// Decoding a batch
     Decoding(ParquetRecordBatchReader),
     /// Reading data from input
-    // Reading(BoxFuture<'static, ReadResult<T>>),
-    Reading,
+    Reading(BoxFuture<'static, ReadResult<T>>),
     /// Error
     Error,
 }
 
-impl std::fmt::Debug for StreamState {
+impl<T> std::fmt::Debug for StreamState<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             StreamState::Init => write!(f, "StreamState::Init"),
             StreamState::Decoding(_) => write!(f, "StreamState::Decoding"),
-            StreamState::Reading => write!(f, "StreamState::Reading"),
+            StreamState::Reading(_) => write!(f, "StreamState::Reading"),
             StreamState::Error => write!(f, "StreamState::Error"),
         }
     }
@@ -460,13 +449,9 @@ pub struct ParquetRecordBatchStream<T> {
     selection: Option<RowSelection>,
 
     /// This is an option so it can be moved into a future
-    reader: Arc<ReaderFactory<T>>,
+    reader: Option<ReaderFactory<T>>,
 
-    state: StreamState,
-
-    row_groups_read_queue: FuturesOrdered<Pin<Box<dyn Future<Output = ReadResult> + Send + 'static>>>,
-
-    prefetch: usize,
+    state: StreamState<T>,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
@@ -477,7 +462,6 @@ impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
             .field("batch_size", &self.batch_size)
             .field("projection", &self.projection)
             .field("state", &self.state)
-            .field("prefetch", &self.prefetch)
             .finish()
     }
 }
@@ -511,45 +495,36 @@ where
                             e.to_string(),
                         ))));
                     }
-                    None => {
-                        self.state = StreamState::Init
-                    },
+                    None => self.state = StreamState::Init,
                 },
                 StreamState::Init => {
-                    while self.row_groups_read_queue.len() < self.prefetch {
-                        let row_group_idx = match self.row_groups.pop_front() {
-                            Some(idx) => idx,
-                            None => {
-                                if self.row_groups_read_queue.is_empty() {
-                                    return Poll::Ready(None)
-                                } else {
-                                    break;
-                                }
-                            },
-                        };
+                    let row_group_idx = match self.row_groups.pop_front() {
+                        Some(idx) => idx,
+                        None => return Poll::Ready(None),
+                    };
 
-                        let row_count =
-                            self.metadata.row_group(row_group_idx).num_rows() as usize;
+                    let reader = self.reader.take().expect("lost reader");
 
-                        let selection =
-                            self.selection.as_mut().map(|s| s.split_off(row_count));
+                    let row_count =
+                        self.metadata.row_group(row_group_idx).num_rows() as usize;
 
-                        unsafe {
-                            let fut = self.reader.clone()
-                                .read_row_group(
-                                    row_group_idx,
-                                    selection,
-                                    self.projection.clone(),
-                                    self.batch_size,
-                                )
-                                .boxed();
-                            self.row_groups_read_queue.push_back(fut);
-                        } // unsafe
-                    } // while
-                    self.state = StreamState::Reading
+                    let selection =
+                        self.selection.as_mut().map(|s| s.split_off(row_count));
+
+                    let fut = reader
+                        .read_row_group(
+                            row_group_idx,
+                            selection,
+                            self.projection.clone(),
+                            self.batch_size,
+                        )
+                        .boxed();
+
+                    self.state = StreamState::Reading(fut)
                 }
-                StreamState::Reading => match ready!(self.row_groups_read_queue.poll_next_unpin(cx)) {
-                    Some(Ok(maybe_reader)) => {
+                StreamState::Reading(f) => match ready!(f.poll_unpin(cx)) {
+                    Ok((reader_factory, maybe_reader)) => {
+                        self.reader = Some(reader_factory);
                         match maybe_reader {
                             // Read records from [`ParquetRecordBatchReader`]
                             Some(reader) => self.state = StreamState::Decoding(reader),
@@ -557,12 +532,9 @@ where
                             None => self.state = StreamState::Init,
                         }
                     }
-                    Some(Err(e)) => {
+                    Err(e) => {
                         self.state = StreamState::Error;
                         return Poll::Ready(Some(Err(e)));
-                    }
-                    None => {
-                        return Poll::Ready(None)
                     }
                 },
                 StreamState::Error => return Poll::Ready(None), // Ends the stream as error happens.
@@ -1435,14 +1407,14 @@ mod tests {
         let projection =
             ProjectionMask::leaves(metadata.file_metadata().schema_descr(), vec![0]);
 
-        let mut reader_factory = Arc::new(ReaderFactory {
+        let reader_factory = ReaderFactory {
             metadata,
             fields,
             input: async_reader,
             filter: None,
             limit: None,
             offset: None,
-        });
+        };
 
         let mut skip = true;
         let mut pages = offset_index[0].iter().peekable();
@@ -1470,12 +1442,10 @@ mod tests {
 
         let selection = RowSelection::from(selectors);
 
-        unsafe {
-            let _reader = reader_factory
-                .read_row_group(0, Some(selection), projection.clone(), 48)
-                .await
-                .expect("reading row group");
-        }
+        let (_factory, _reader) = reader_factory
+            .read_row_group(0, Some(selection), projection.clone(), 48)
+            .await
+            .expect("reading row group");
 
         let requests = requests.lock().unwrap();
 

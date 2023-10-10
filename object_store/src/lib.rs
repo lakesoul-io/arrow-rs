@@ -382,15 +382,12 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         location: &Path,
         ranges: &[Range<usize>],
     ) -> Result<Vec<Bytes>> {
-        let ret = coalesce_ranges(
+        coalesce_ranges(
             ranges,
-            |range| {
-                self.get_range(location, range)
-            },
+            |range| self.get_range(location, range),
             OBJECT_STORE_COALESCE_DEFAULT,
         )
-        .await;
-        ret
+        .await
     }
 
     /// Return the metadata for the specified location
