@@ -74,6 +74,8 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) limit: Option<usize>,
 
     pub(crate) offset: Option<usize>,
+
+    pub(crate) prefetch: usize,
 }
 
 impl<T> ArrowReaderBuilder<T> {
@@ -90,6 +92,7 @@ impl<T> ArrowReaderBuilder<T> {
             selection: None,
             limit: None,
             offset: None,
+            prefetch: 2usize,
         }
     }
 
@@ -178,6 +181,13 @@ impl<T> ArrowReaderBuilder<T> {
     pub fn with_offset(self, offset: usize) -> Self {
         Self {
             offset: Some(offset),
+            ..self
+        }
+    }
+
+    pub fn with_prefetch(self, n: usize) -> Self {
+        Self {
+            prefetch: n,
             ..self
         }
     }
