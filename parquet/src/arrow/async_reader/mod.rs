@@ -277,6 +277,8 @@ impl<T: AsyncFileReader + Send + 'static> ArrowReaderBuilder<AsyncReader<T>> {
             offset: self.offset,
         };
 
+        let prefetch = self.prefetch;
+
         Ok(ParquetRecordBatchStream {
             metadata: self.metadata,
             batch_size,
@@ -286,6 +288,8 @@ impl<T: AsyncFileReader + Send + 'static> ArrowReaderBuilder<AsyncReader<T>> {
             schema: self.schema,
             reader: Some(reader),
             state: StreamState::Init,
+            prefetch,
+            next_read_fut: None,
         })
     }
 }
@@ -452,6 +456,10 @@ pub struct ParquetRecordBatchStream<T> {
     reader: Option<ReaderFactory<T>>,
 
     state: StreamState<T>,
+
+    prefetch: usize,
+
+    next_read_fut: Option<BoxFuture<'static, ReadResult<T>>>,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
@@ -462,14 +470,56 @@ impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
             .field("batch_size", &self.batch_size)
             .field("projection", &self.projection)
             .field("state", &self.state)
+            .field("prefetch", &self.prefetch)
             .finish()
     }
 }
 
-impl<T> ParquetRecordBatchStream<T> {
+impl<T> ParquetRecordBatchStream<T>
+where
+    T: AsyncFileReader + Send,
+{
     /// Returns the [`SchemaRef`] for this parquet file
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    fn prepare_read_params(
+        &mut self,
+    ) -> Option<(
+        usize,
+        ReaderFactory<T>,
+        Option<RowSelection>,
+        ProjectionMask,
+        usize,
+    )> {
+        match self.row_groups.pop_front() {
+            Some(idx) => {
+                let reader = self.reader.take().expect("lost reader");
+                let row_count = self.metadata.row_group(idx).num_rows() as usize;
+                let selection = self.selection.as_mut().map(|s| s.split_off(row_count));
+                Some((
+                    idx,
+                    reader,
+                    selection,
+                    self.projection.clone(),
+                    self.batch_size,
+                ))
+            }
+            None => None,
+        }
+    }
+
+    async fn read_next_row_group(
+        reader: ReaderFactory<T>,
+        row_group_idx: usize,
+        selection: Option<RowSelection>,
+        projection: ProjectionMask,
+        batch_size: usize,
+    ) -> ReadResult<T> {
+        reader
+            .read_row_group(row_group_idx, selection, projection, batch_size)
+            .await
     }
 }
 
@@ -498,33 +548,60 @@ where
                     None => self.state = StreamState::Init,
                 },
                 StreamState::Init => {
-                    let row_group_idx = match self.row_groups.pop_front() {
-                        Some(idx) => idx,
-                        None => return Poll::Ready(None),
-                    };
+                    if self.next_read_fut.is_some() {
+                        let fut = self.next_read_fut.take().expect("some future");
+                        self.state = StreamState::Reading(fut);
+                    } else {
+                        match self.prepare_read_params() {
+                            Some((
+                                row_group_idx,
+                                reader,
+                                selection,
+                                projection,
+                                batch_size,
+                            )) => {
+                                let fut = ParquetRecordBatchStream::read_next_row_group(
+                                    reader,
+                                    row_group_idx,
+                                    selection,
+                                    projection,
+                                    batch_size,
+                                )
+                                .boxed();
 
-                    let reader = self.reader.take().expect("lost reader");
-
-                    let row_count =
-                        self.metadata.row_group(row_group_idx).num_rows() as usize;
-
-                    let selection =
-                        self.selection.as_mut().map(|s| s.split_off(row_count));
-
-                    let fut = reader
-                        .read_row_group(
-                            row_group_idx,
-                            selection,
-                            self.projection.clone(),
-                            self.batch_size,
-                        )
-                        .boxed();
-
-                    self.state = StreamState::Reading(fut)
+                                self.state = StreamState::Reading(fut);
+                            }
+                            None => return Poll::Ready(None),
+                        }
+                    }
                 }
                 StreamState::Reading(f) => match ready!(f.poll_unpin(cx)) {
                     Ok((reader_factory, maybe_reader)) => {
                         self.reader = Some(reader_factory);
+                        if self.prefetch > 1 {
+                            match self.prepare_read_params() {
+                                Some((
+                                    row_group_idx,
+                                    reader,
+                                    selection,
+                                    projection,
+                                    batch_size,
+                                )) => {
+                                    let fut =
+                                        ParquetRecordBatchStream::read_next_row_group(
+                                            reader,
+                                            row_group_idx,
+                                            selection,
+                                            projection,
+                                            batch_size,
+                                        )
+                                        .boxed();
+                                    self.next_read_fut = Some(fut);
+                                }
+                                None => {}
+                            }
+                        }
+
                         match maybe_reader {
                             // Read records from [`ParquetRecordBatchReader`]
                             Some(reader) => self.state = StreamState::Decoding(reader),
