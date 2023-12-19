@@ -16,6 +16,7 @@
 // under the License.
 
 //! Common logic for interacting with remote object stores
+use std::time::Instant;
 use super::Result;
 use bytes::Bytes;
 use futures::{stream::StreamExt, Stream, TryStreamExt};
@@ -90,11 +91,11 @@ where
 
 /// Range requests with a gap less than or equal to this,
 /// will be coalesced into a single request by [`coalesce_ranges`]
-pub const OBJECT_STORE_COALESCE_DEFAULT: usize = 1024 * 1024;
+pub const OBJECT_STORE_COALESCE_DEFAULT: usize = 256 * 1024;
 
 /// Up to this number of range requests will be performed in parallel by [`coalesce_ranges`]
 pub const OBJECT_STORE_COALESCE_PARALLEL: usize = 10;
-pub const OBJECT_STORE_COALESCE_MAX: usize = 8 * 1024 * 1024;
+pub const OBJECT_STORE_COALESCE_MAX: usize = 4 * 1024 * 1024;
 
 /// Takes a function `fetch` that can fetch a range of bytes and uses this to
 /// fetch the provided byte `ranges`
@@ -116,11 +117,14 @@ where
 {
     let fetch_ranges = merge_ranges(ranges, coalesce, OBJECT_STORE_COALESCE_MAX);
 
+    let start = Instant::now();
+
     let fetched: Vec<_> = futures::stream::iter(fetch_ranges.iter().cloned())
         .map(fetch)
         .buffered(OBJECT_STORE_COALESCE_PARALLEL)
         .try_collect()
         .await?;
+    println!("Fetch ranges {:?} in {:?}ms", fetch_ranges, start.elapsed());
 
     Ok(ranges
         .iter()

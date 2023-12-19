@@ -709,7 +709,7 @@ where
                                     projection,
                                     batch_size,
                                 )) => {
-                                    let fut =
+                                    let mut fut =
                                         ParquetRecordBatchStream::read_next_row_group(
                                             reader,
                                             row_group_idx,
