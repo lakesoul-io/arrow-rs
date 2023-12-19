@@ -94,6 +94,7 @@ pub const OBJECT_STORE_COALESCE_DEFAULT: usize = 1024 * 1024;
 
 /// Up to this number of range requests will be performed in parallel by [`coalesce_ranges`]
 pub const OBJECT_STORE_COALESCE_PARALLEL: usize = 10;
+pub const OBJECT_STORE_COALESCE_MAX: usize = 4 * 1024 * 1024;
 
 /// Takes a function `fetch` that can fetch a range of bytes and uses this to
 /// fetch the provided byte `ranges`
@@ -110,10 +111,10 @@ pub async fn coalesce_ranges<F, E, Fut>(
 ) -> Result<Vec<Bytes>, E>
 where
     F: Send + FnMut(std::ops::Range<usize>) -> Fut,
-    E: Send,
+    E: Send + std::fmt::Debug,
     Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
 {
-    let fetch_ranges = merge_ranges(ranges, coalesce);
+    let fetch_ranges = merge_ranges(ranges, coalesce, OBJECT_STORE_COALESCE_MAX);
 
     let fetched: Vec<_> = futures::stream::iter(fetch_ranges.iter().cloned())
         .map(fetch)
@@ -139,6 +140,7 @@ where
 fn merge_ranges(
     ranges: &[std::ops::Range<usize>],
     coalesce: usize,
+    range_max_size: usize,
 ) -> Vec<std::ops::Range<usize>> {
     if ranges.is_empty() {
         return vec![];
@@ -152,6 +154,7 @@ fn merge_ranges(
     let mut end_idx = 1;
 
     while start_idx != ranges.len() {
+        let range_begin = ranges[start_idx].start;
         let mut range_end = ranges[start_idx].end;
 
         while end_idx != ranges.len()
@@ -163,6 +166,9 @@ fn merge_ranges(
         {
             range_end = range_end.max(ranges[end_idx].end);
             end_idx += 1;
+            if range_end - range_begin >= range_max_size {
+                break;
+            }
         }
 
         let start = ranges[start_idx].start;
