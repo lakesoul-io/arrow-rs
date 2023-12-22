@@ -412,6 +412,8 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             state: StreamState::Init,
             prefetch,
             next_read_fut: None,
+            batch_reader_queue: VecDeque::with_capacity(std::cmp::max(1, prefetch)),
+            pending_read: 0,
         })
     }
 }
@@ -541,7 +543,7 @@ enum StreamState<T> {
     /// At the start of a new row group, or the end of the parquet stream
     Init,
     /// Decoding a batch
-    Decoding(ParquetRecordBatchReader),
+    Decoding,
     /// Reading data from input
     Reading(BoxFuture<'static, ReadResult<T>>),
     /// Error
@@ -552,7 +554,7 @@ impl<T> std::fmt::Debug for StreamState<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             StreamState::Init => write!(f, "StreamState::Init"),
-            StreamState::Decoding(_) => write!(f, "StreamState::Decoding"),
+            StreamState::Decoding => write!(f, "StreamState::Decoding"),
             StreamState::Reading(_) => write!(f, "StreamState::Reading"),
             StreamState::Error => write!(f, "StreamState::Error"),
         }
@@ -581,7 +583,13 @@ pub struct ParquetRecordBatchStream<T> {
 
     prefetch: usize,
 
+    // we would allow only one pending read since
+    // read_next_rowgroup is not reentrant safe
     next_read_fut: Option<BoxFuture<'static, ReadResult<T>>>,
+
+    batch_reader_queue: VecDeque<ParquetRecordBatchReader>,
+
+    pending_read: usize,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
@@ -599,7 +607,7 @@ impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
 
 impl<T> ParquetRecordBatchStream<T>
 where
-    T: AsyncFileReader + Send,
+    T: AsyncFileReader + Send + 'static,
 {
     /// Returns the [`SchemaRef`] for this parquet file
     pub fn schema(&self) -> &SchemaRef {
@@ -643,6 +651,34 @@ where
             .read_row_group(row_group_idx, selection, projection, batch_size)
             .await
     }
+
+    fn maybe_initiate_next_read(&mut self, prefetch: bool) -> Option<BoxFuture<'static, ReadResult<T>>> {
+        if !prefetch || (prefetch && self.pending_read < self.prefetch) {
+            match self.prepare_read_params() {
+                Some((
+                         row_group_idx,
+                         reader,
+                         selection,
+                         projection,
+                         batch_size,
+                     )) => {
+                    let fut = ParquetRecordBatchStream::read_next_row_group(
+                        reader,
+                        row_group_idx,
+                        selection,
+                        projection,
+                        batch_size,
+                    )
+                        .boxed();
+                    self.pending_read += 1;
+                    Some(fut)
+                },
+                None => None,
+            }
+        } else {
+            None
+        }
+    }
 }
 
 impl<T> Stream for ParquetRecordBatchStream<T>
@@ -657,76 +693,95 @@ where
     ) -> Poll<Option<Self::Item>> {
         loop {
             match &mut self.state {
-                StreamState::Decoding(batch_reader) => match batch_reader.next() {
-                    Some(Ok(batch)) => {
-                        return Poll::Ready(Some(Ok(batch)));
+                StreamState::Decoding => {
+                    // we should poll next read future here to drive it in background
+                    // and push ready reader into the queue back.
+                    // and see if we should initiate next read
+                    if self.next_read_fut.is_some() {
+                        let mut read_fut = self.next_read_fut.take().expect("some reader");
+                        if let Poll::Ready(read_result) = read_fut.poll_unpin(cx) {
+                            println!("ready 1");
+                            self.pending_read -= 1;
+                            match read_result {
+                                Ok((reader_factory, maybe_reader)) => {
+                                    self.reader = Some(reader_factory);
+                                    match maybe_reader {
+                                        // Read records from [`ParquetRecordBatchReader`]
+                                        Some(reader) => {
+                                            self.batch_reader_queue.push_back(reader);
+                                            // try to initiate next rowgroup read
+                                            // ignore when there's no next rowgroup
+                                            // or we have reached prefetch limit
+                                            if let Some(fut) = self.maybe_initiate_next_read(true) {
+                                                println!("prefetch occurs 1");
+                                                self.next_read_fut = Some(fut);
+                                            }
+                                        },
+                                        // All rows skipped, read next row group
+                                        None => self.state = StreamState::Init,
+                                    }
+                                },
+                                Err(e) => {
+                                    self.state = StreamState::Error;
+                                    return Poll::Ready(Some(Err(e)));
+                                }
+                            }
+                        } else {
+                            // next read haven't finished yet
+                            self.next_read_fut = Some(read_fut);
+                        }
                     }
-                    Some(Err(e)) => {
-                        self.state = StreamState::Error;
-                        return Poll::Ready(Some(Err(ParquetError::ArrowError(
-                            e.to_string(),
-                        ))));
+                    let mut batch_reader = self.batch_reader_queue.pop_front().unwrap();
+                    match batch_reader.next() {
+                        Some(Ok(batch)) => {
+                            // we haven't finished this reader yet,
+                            // so push this reader back into queue front
+                            self.batch_reader_queue.push_front(batch_reader);
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
+                        Some(Err(e)) => {
+                            self.state = StreamState::Error;
+                            return Poll::Ready(Some(Err(ParquetError::ArrowError(
+                                e.to_string(),
+                            ))));
+                        }
+                        None => self.state = StreamState::Init,
                     }
-                    None => self.state = StreamState::Init,
                 },
                 StreamState::Init => {
-                    if self.next_read_fut.is_some() {
+                    if !self.batch_reader_queue.is_empty() {
+                        println!("has prefethced reader");
+                        // we have reader in queue, directly jump to Decoding state
+                        self.state = StreamState::Decoding;
+                    }
+                    else if self.next_read_fut.is_some() {
                         let fut = self.next_read_fut.take().expect("some future");
                         self.state = StreamState::Reading(fut);
                     } else {
-                        match self.prepare_read_params() {
-                            Some((
-                                row_group_idx,
-                                reader,
-                                selection,
-                                projection,
-                                batch_size,
-                            )) => {
-                                let fut = ParquetRecordBatchStream::read_next_row_group(
-                                    reader,
-                                    row_group_idx,
-                                    selection,
-                                    projection,
-                                    batch_size,
-                                )
-                                .boxed();
-
+                        match self.maybe_initiate_next_read(false) {
+                            Some(fut) => {
                                 self.state = StreamState::Reading(fut);
-                            }
+                            },
                             None => return Poll::Ready(None),
                         }
                     }
                 }
                 StreamState::Reading(f) => match ready!(f.poll_unpin(cx)) {
                     Ok((reader_factory, maybe_reader)) => {
+                        println!("ready 2");
+                        self.pending_read -= 1;
                         self.reader = Some(reader_factory);
-                        if self.prefetch > 1 {
-                            match self.prepare_read_params() {
-                                Some((
-                                    row_group_idx,
-                                    reader,
-                                    selection,
-                                    projection,
-                                    batch_size,
-                                )) => {
-                                    let mut fut =
-                                        ParquetRecordBatchStream::read_next_row_group(
-                                            reader,
-                                            row_group_idx,
-                                            selection,
-                                            projection,
-                                            batch_size,
-                                        )
-                                        .boxed();
-                                    self.next_read_fut = Some(fut);
-                                }
-                                None => {}
-                            }
+                        if let Some(fut) = self.maybe_initiate_next_read(true) {
+                            println!("prefetch occurs 2");
+                            self.next_read_fut = Some(fut);
                         }
 
                         match maybe_reader {
                             // Read records from [`ParquetRecordBatchReader`]
-                            Some(reader) => self.state = StreamState::Decoding(reader),
+                            Some(reader) => {
+                                self.batch_reader_queue.push_back(reader);
+                                self.state = StreamState::Decoding;
+                            },
                             // All rows skipped, read next row group
                             None => self.state = StreamState::Init,
                         }
