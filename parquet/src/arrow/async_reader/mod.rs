@@ -122,6 +122,7 @@ mod store;
 use crate::arrow::schema::ParquetField;
 #[cfg(feature = "object_store")]
 pub use store::*;
+use crate::errors::ParquetError::External;
 
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 pub trait AsyncFileReader: Send {
@@ -653,7 +654,7 @@ where
     }
 
     fn maybe_initiate_next_read(&mut self, prefetch: bool) -> Option<BoxFuture<'static, ReadResult<T>>> {
-        if !prefetch || (prefetch && self.pending_read < self.prefetch) {
+        if !prefetch || (prefetch && self.pending_read <= self.prefetch) {
             match self.prepare_read_params() {
                 Some((
                          row_group_idx,
@@ -662,14 +663,18 @@ where
                          projection,
                          batch_size,
                      )) => {
-                    let fut = ParquetRecordBatchStream::read_next_row_group(
-                        reader,
-                        row_group_idx,
-                        selection,
-                        projection,
-                        batch_size,
-                    )
-                        .boxed();
+                    let fut = tokio::spawn(async move {
+                        ParquetRecordBatchStream::read_next_row_group(
+                            reader,
+                            row_group_idx,
+                            selection,
+                            projection,
+                            batch_size,
+                        ).await
+                    }).map(|r| match r {
+                        Ok(read_result) => read_result,
+                        Err(e) => Err(External(Box::new(e)))
+                    }).boxed();
                     self.pending_read += 1;
                     Some(fut)
                 },
@@ -677,6 +682,49 @@ where
             }
         } else {
             None
+        }
+    }
+
+    fn poll_and_maybe_next(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        // we should poll next read future here to drive it in background
+        // and push ready reader into the queue back.
+        // and see if we should initiate next read
+        if self.next_read_fut.is_some() {
+            let mut read_fut = self.next_read_fut.take().expect("some reader");
+            if let Poll::Ready(read_result) = read_fut.poll_unpin(cx) {
+                match read_result {
+                    Ok((reader_factory, maybe_reader)) => {
+                        self.reader = Some(reader_factory);
+                        match maybe_reader {
+                            // Read records from [`ParquetRecordBatchReader`]
+                            Some(reader) => {
+                                self.batch_reader_queue.push_back(reader);
+                            },
+                            None => (),
+                        }
+                        // try to initiate next rowgroup read
+                        // ignore when there's no next rowgroup
+                        // or we have reached prefetch limit
+                        if let Some(fut) = self.maybe_initiate_next_read(true) {
+                            self.next_read_fut = Some(fut);
+                        }
+                        Ok(())
+                    },
+                    Err(e) => {
+                        self.state = StreamState::Error;
+                        Err(e)
+                    }
+                }
+            } else {
+                // next read haven't finished yet
+                self.next_read_fut = Some(read_fut);
+                Ok(())
+            }
+        } else {
+            if let Some(fut) = self.maybe_initiate_next_read(true) {
+                self.next_read_fut = Some(fut);
+            }
+            Ok(())
         }
     }
 }
@@ -694,42 +742,10 @@ where
         loop {
             match &mut self.state {
                 StreamState::Decoding => {
-                    // we should poll next read future here to drive it in background
-                    // and push ready reader into the queue back.
-                    // and see if we should initiate next read
-                    if self.next_read_fut.is_some() {
-                        let mut read_fut = self.next_read_fut.take().expect("some reader");
-                        if let Poll::Ready(read_result) = read_fut.poll_unpin(cx) {
-                            println!("ready 1");
-                            self.pending_read -= 1;
-                            match read_result {
-                                Ok((reader_factory, maybe_reader)) => {
-                                    self.reader = Some(reader_factory);
-                                    match maybe_reader {
-                                        // Read records from [`ParquetRecordBatchReader`]
-                                        Some(reader) => {
-                                            self.batch_reader_queue.push_back(reader);
-                                            // try to initiate next rowgroup read
-                                            // ignore when there's no next rowgroup
-                                            // or we have reached prefetch limit
-                                            if let Some(fut) = self.maybe_initiate_next_read(true) {
-                                                println!("prefetch occurs 1");
-                                                self.next_read_fut = Some(fut);
-                                            }
-                                        },
-                                        // All rows skipped, read next row group
-                                        None => self.state = StreamState::Init,
-                                    }
-                                },
-                                Err(e) => {
-                                    self.state = StreamState::Error;
-                                    return Poll::Ready(Some(Err(e)));
-                                }
-                            }
-                        } else {
-                            // next read haven't finished yet
-                            self.next_read_fut = Some(read_fut);
-                        }
+                    match self.poll_and_maybe_next(cx) {
+                        // failfast
+                        Err(e) => return Poll::Ready(Some(Err(e))),
+                        _ => (),
                     }
                     let mut batch_reader = self.batch_reader_queue.pop_front().unwrap();
                     match batch_reader.next() {
@@ -745,14 +761,21 @@ where
                                 e.to_string(),
                             ))));
                         }
-                        None => self.state = StreamState::Init,
+                        None => self.state = {
+                            self.pending_read -= 1;
+                            StreamState::Init
+                        },
                     }
                 },
                 StreamState::Init => {
                     if !self.batch_reader_queue.is_empty() {
-                        println!("has prefethced reader");
                         // we have reader in queue, directly jump to Decoding state
                         self.state = StreamState::Decoding;
+                        match self.poll_and_maybe_next(cx) {
+                            // failfast
+                            Err(e) => return Poll::Ready(Some(Err(e))),
+                            _ => (),
+                        }
                     }
                     else if self.next_read_fut.is_some() {
                         let fut = self.next_read_fut.take().expect("some future");
@@ -768,11 +791,8 @@ where
                 }
                 StreamState::Reading(f) => match ready!(f.poll_unpin(cx)) {
                     Ok((reader_factory, maybe_reader)) => {
-                        println!("ready 2");
-                        self.pending_read -= 1;
                         self.reader = Some(reader_factory);
                         if let Some(fut) = self.maybe_initiate_next_read(true) {
-                            println!("prefetch occurs 2");
                             self.next_read_fut = Some(fut);
                         }
 
