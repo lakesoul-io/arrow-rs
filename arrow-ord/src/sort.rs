@@ -175,7 +175,7 @@ where
     F: FnMut(&T, &T) -> Ordering,
 {
     if array.len() == limit {
-        array.sort_unstable_by(cmp);
+        array.sort_by(cmp);
     } else {
         partial_sort(array, limit, cmp);
     }
@@ -709,7 +709,7 @@ where
 {
     if let Some(n) = limit.checked_sub(1) {
         let (before, _mid, _after) = v.select_nth_unstable_by(n, &mut is_less);
-        before.sort_unstable_by(is_less);
+        before.sort_by(is_less);
     }
 }
 
